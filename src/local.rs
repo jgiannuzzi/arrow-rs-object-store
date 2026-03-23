@@ -228,6 +228,7 @@ pub struct LocalFileSystem {
     config: Arc<Config>,
     // if you want to delete empty directories when deleting files
     automatic_cleanup: bool,
+    sync_on_close: bool,
 }
 
 #[derive(Debug)]
@@ -255,6 +256,7 @@ impl LocalFileSystem {
                 root: Url::parse("file:///").unwrap(),
             }),
             automatic_cleanup: false,
+            sync_on_close: false,
         }
     }
 
@@ -273,6 +275,7 @@ impl LocalFileSystem {
                 root: absolute_path_to_url(path)?,
             }),
             automatic_cleanup: false,
+            sync_on_close: false,
         })
     }
 
@@ -284,6 +287,17 @@ impl LocalFileSystem {
     /// Enable automatic cleanup of empty directories when deleting files
     pub fn with_automatic_cleanup(mut self, automatic_cleanup: bool) -> Self {
         self.automatic_cleanup = automatic_cleanup;
+        self
+    }
+
+    /// Calls [`File::sync_all`] before closing files written by this store.
+    ///
+    /// This provides stronger durability guarantees at the cost of performance,
+    /// and is particularly important on network filesystems.
+    ///
+    /// Default: `false`
+    pub fn with_sync_on_close(mut self, sync: bool) -> Self {
+        self.sync_on_close = sync;
         self
     }
 }
@@ -374,6 +388,7 @@ impl ObjectStore for LocalFileSystem {
         }
 
         let path = self.path_to_filesystem(location)?;
+        let sync_on_close = self.sync_on_close;
         maybe_spawn_blocking(move || {
             let (mut file, staging_path) = new_staged_upload(&path)?;
             let mut e_tag = None;
@@ -385,6 +400,10 @@ impl ObjectStore for LocalFileSystem {
                         path: path.to_string_lossy().to_string(),
                     })?;
                     e_tag = Some(get_etag(&metadata));
+                    if sync_on_close {
+                        file.sync_all()
+                            .map_err(|source| Error::UnableToCopyDataToFile { source })?;
+                    }
                     // Explicitly close the file, checking for errors that would be silently ignored by drop.
                     // On network filesystems (e.g. NFS), close can fail and indicate data loss.
                     //
@@ -442,7 +461,12 @@ impl ObjectStore for LocalFileSystem {
 
         let dest = self.path_to_filesystem(location)?;
         let (file, src) = new_staged_upload(&dest)?;
-        Ok(Box::new(LocalUpload::new(src, dest, file)))
+        Ok(Box::new(LocalUpload::new(
+            src,
+            dest,
+            file,
+            self.sync_on_close,
+        )))
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
@@ -868,14 +892,16 @@ struct LocalUpload {
 struct UploadState {
     dest: PathBuf,
     file: Mutex<Option<File>>,
+    sync_on_close: bool,
 }
 
 impl LocalUpload {
-    pub(crate) fn new(src: PathBuf, dest: PathBuf, file: File) -> Self {
+    pub(crate) fn new(src: PathBuf, dest: PathBuf, file: File, sync_on_close: bool) -> Self {
         Self {
             state: Arc::new(UploadState {
                 dest,
                 file: Mutex::new(Some(file)),
+                sync_on_close,
             }),
             src: Some(src),
             offset: 0,
@@ -914,6 +940,11 @@ impl MultipartUpload for LocalUpload {
             // Ensure no inflight writes
             let mut guard = s.file.lock();
             let file = guard.take().ok_or(Error::Aborted)?;
+
+            if s.sync_on_close {
+                file.sync_all()
+                    .map_err(|source| Error::UnableToCopyDataToFile { source })?;
+            }
 
             let metadata = file.metadata().map_err(|e| Error::Metadata {
                 source: e.into(),
@@ -1307,6 +1338,26 @@ mod tests {
     async fn file_test() {
         let root = TempDir::new().unwrap();
         let integration = LocalFileSystem::new_with_prefix(root.path()).unwrap();
+
+        put_get_delete_list(&integration).await;
+        list_with_offset_exclusivity(&integration).await;
+        get_opts(&integration).await;
+        list_uses_directories_correctly(&integration).await;
+        list_with_delimiter(&integration).await;
+        rename_and_copy(&integration).await;
+        copy_if_not_exists(&integration).await;
+        copy_rename_nonexistent_object(&integration).await;
+        stream_get(&integration).await;
+        put_opts(&integration, false).await;
+    }
+
+    #[tokio::test]
+    #[cfg(target_family = "unix")]
+    async fn file_test_sync_on_close() {
+        let root = TempDir::new().unwrap();
+        let integration = LocalFileSystem::new_with_prefix(root.path())
+            .unwrap()
+            .with_sync_on_close(true);
 
         put_get_delete_list(&integration).await;
         list_with_offset_exclusivity(&integration).await;
